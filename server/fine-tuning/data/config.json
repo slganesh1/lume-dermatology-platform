@@ -1,0 +1,11 @@
+{
+  "jobId": "ftjob-QZrtu0YPo0TVSUtnly2t28g3",
+  "jobStatus": "validating_files",
+  "jobStartTime": "2025-05-26T09:00:39.999Z",
+  "modelName": "dermatology-model-enhanced",
+  "epochs": 5,
+  "baseModel": "ft:dermatology-model-118690",
+  "fileId": "file-L5v3AQDEkRVYeBmHVQppwt",
+  "enabled": true,
+  "modelId": "ft:gpt-3.5-turbo-0125:personal::B5T0l4am"
+}

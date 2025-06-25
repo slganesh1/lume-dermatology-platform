@@ -1,0 +1,1141 @@
+import { Request, Response, Router } from 'express';
+import multer from 'multer';
+import path from 'path';
+import fs from 'fs';
+import { fileURLToPath } from 'url';
+import { requireRole } from '../auth';
+import { db } from '../db';
+import OpenAI from 'openai';
+
+// Get dirname equivalent in ES modules
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+// Configure storage for uploaded images
+// For absolute clarity of where files are uploaded to
+const uploadDir = path.join(__dirname, 'data', 'images');
+console.log('Image upload directory:', uploadDir);
+// Create directory if it doesn't exist
+if (!fs.existsSync(uploadDir)) {
+  try {
+    fs.mkdirSync(uploadDir, { recursive: true });
+    console.log('Created upload directory:', uploadDir);
+  } catch (error) {
+    console.error('Error creating upload directory:', error);
+  }
+}
+
+const storage = multer.diskStorage({
+  destination: function (req, file, cb) {
+    // Already created above, but just to be sure
+    if (!fs.existsSync(uploadDir)) {
+      fs.mkdirSync(uploadDir, { recursive: true });
+    }
+    cb(null, uploadDir);
+  },
+  filename: function (req, file, cb) {
+    // Sanitize the filename to prevent issues
+    const filename = file.originalname.replace(/[^a-zA-Z0-9_.-]/g, '_');
+    // Add timestamp to prevent duplicates but keep original name for readability
+    const timestamp = Date.now();
+    cb(null, timestamp + '-' + filename);
+  }
+});
+
+// Set up multer for handling file uploads
+const upload = multer({ 
+  storage,
+  limits: { fileSize: 50 * 1024 * 1024 }, // 50MB max file size
+  fileFilter: (req, file, cb) => {
+    // Accept only image files
+    const filetypes = /jpeg|jpg|png|webp/;
+    const mimetype = filetypes.test(file.mimetype);
+    const extname = filetypes.test(path.extname(file.originalname).toLowerCase());
+    if (mimetype && extname) {
+      return cb(null, true);
+    }
+    cb(new Error('Only image files (jpg, jpeg, png, webp) are allowed!'));
+  }
+});
+
+// Configuration for fine-tuning
+const configPath = path.join(__dirname, 'config.json');
+const casesPath = path.join(__dirname, 'data', 'dermatology_cases.json');
+const imagesDir = path.join(__dirname, 'data', 'images');
+
+// Helper functions
+function loadConfig() {
+  try {
+    if (fs.existsSync(configPath)) {
+      return JSON.parse(fs.readFileSync(configPath, 'utf-8'));
+    }
+  } catch (error) {
+    console.error('Error loading configuration:', error);
+  }
+  return { 
+    enabled: false, 
+    modelId: '', 
+    fallbackToDefaultModel: true 
+  };
+}
+
+function saveConfig(config: any) {
+  try {
+    fs.writeFileSync(configPath, JSON.stringify(config, null, 2));
+    return true;
+  } catch (error) {
+    console.error('Error saving configuration:', error);
+    return false;
+  }
+}
+
+function loadCases() {
+  try {
+    if (fs.existsSync(casesPath)) {
+      return JSON.parse(fs.readFileSync(casesPath, 'utf-8'));
+    }
+  } catch (error) {
+    console.error('Error loading cases:', error);
+  }
+  return [];
+}
+
+function saveCases(cases: any[]) {
+  try {
+    if (!fs.existsSync(path.dirname(casesPath))) {
+      fs.mkdirSync(path.dirname(casesPath), { recursive: true });
+    }
+    fs.writeFileSync(casesPath, JSON.stringify(cases, null, 2));
+    return true;
+  } catch (error) {
+    console.error('Error saving cases:', error);
+    return false;
+  }
+}
+
+// Initialize OpenAI client when needed
+function getOpenAIClient() {
+  if (!process.env.OPENAI_API_KEY) {
+    throw new Error('OPENAI_API_KEY environment variable is required for fine-tuning');
+  }
+  return new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+}
+
+// Define API router
+export const finetuningRouter = Router();
+
+// Authentication middleware - only doctors can access most fine-tuning admin routes
+// Apply authentication to all routes except the admin page and basic data endpoints (for testing)
+finetuningRouter.use((req, res, next) => {
+  // Skip authentication for these paths during development/testing
+  const publicPaths = ['/admin-page', '/status', '/images', '/training-data', '/image', '/test-page'];
+  // Check if path is in publicPaths or starts with /image/
+  if (publicPaths.includes(req.path) || req.path.startsWith('/image/')) {
+    return next();
+  }
+  // For all other endpoints, require doctor role
+  requireRole('doctor')(req, res, next);
+});
+
+// Get fine-tuning status
+finetuningRouter.get('/status', (req: Request, res: Response) => {
+  const config = loadConfig();
+  const cases = loadCases();
+  
+  // Get list of images in the directory
+  let images: string[] = [];
+  if (fs.existsSync(imagesDir)) {
+    images = fs.readdirSync(imagesDir)
+      .filter(file => /\.(jpg|jpeg|png|webp)$/i.test(file));
+  }
+  
+  // Add job status information
+  const jobStatus = {
+    id: config.jobId || null,
+    status: config.jobStatus || 'none',
+    startTime: config.jobStartTime || null,
+    model: config.modelId || null
+  };
+
+  res.json({
+    config,
+    jobStatus,
+    stats: {
+      totalCases: cases.length,
+      totalImages: images.length,
+      imagesWithoutCases: images.filter(img => 
+        !cases.some((c: any) => c.imageFileName === img)
+      ).length,
+      casesWithoutImages: cases.filter((c: any) => 
+        !images.includes(c.imageFileName)
+      ).length
+    }
+  });
+});
+
+// Get list of images for the dropdown
+finetuningRouter.get('/images', (req: Request, res: Response) => {
+  // Get list of images in the directory
+  let images: string[] = [];
+  if (fs.existsSync(imagesDir)) {
+    images = fs.readdirSync(imagesDir)
+      .filter(file => /\.(jpg|jpeg|png|webp)$/i.test(file));
+  }
+  
+  res.json(images);
+});
+
+// Serve image file
+finetuningRouter.get('/image/:filename', (req: Request, res: Response) => {
+  const filename = req.params.filename;
+  const imagePath = path.join(imagesDir, filename);
+  
+  if (fs.existsSync(imagePath)) {
+    res.sendFile(imagePath);
+  } else {
+    res.status(404).send('Image not found');
+  }
+});
+
+// Upload images for fine-tuning
+finetuningRouter.post('/upload-image', (req: Request, res: Response) => {
+  // Add comprehensive error handling
+  try {
+    // Use a more robust approach to handling file uploads
+    upload.array('images', 50)(req, res, (err) => {
+      if (err) {
+        // Log detailed error information
+        console.error('Upload error:', err);
+        console.error('Error type:', typeof err);
+        console.error('Error details:', JSON.stringify({
+          message: err.message,
+          name: err.name,
+          code: err.code,
+          field: (err as any).field,
+          storageErrors: (err as any).storageErrors,
+        }, null, 2));
+        
+        // Check for specific error types
+        if (err.name === 'MulterError') {
+          if (err.code === 'LIMIT_FILE_SIZE') {
+            return res.status(400).json({ 
+              error: 'File too large', 
+              message: 'Maximum file size is 50MB. Please upload a smaller file or compress your image.',
+              details: err.message
+            });
+          }
+        }
+        
+        return res.status(400).json({ 
+          error: 'File upload error', 
+          message: err.message,
+          details: 'Check that your files are valid image files (JPG, PNG, WebP) and not corrupted.'
+        });
+      }
+      
+      const files = req.files as Express.Multer.File[];
+      if (!files || files.length === 0) {
+        return res.status(400).json({ error: 'No files uploaded' });
+      }
+      
+      console.log('Files uploaded:', files.length);
+      console.log('Upload directory:', uploadDir);
+      
+      // Return success with file info
+      return res.status(200).json({
+        message: `${files.length} files uploaded successfully`,
+        files: files.map(file => ({
+          originalname: file.originalname,
+          filename: file.filename,
+          path: file.path,
+          size: file.size
+        }))
+      });
+    });
+  } catch (error) {
+    console.error('Unexpected upload error:', error);
+    return res.status(500).json({ error: 'Server error during file upload' });
+  }
+});
+
+// Add or update training data
+finetuningRouter.post('/training-data', (req: Request, res: Response) => {
+  const { cases } = req.body;
+  
+  if (!Array.isArray(cases)) {
+    return res.status(400).json({ error: 'Invalid data format' });
+  }
+  
+  const existingCases = loadCases();
+  const updatedCases = [...existingCases];
+  
+  // Add or update cases
+  for (const newCase of cases) {
+    const index = existingCases.findIndex((c: any) => 
+      c.imageFileName === newCase.imageFileName
+    );
+    
+    if (index >= 0) {
+      updatedCases[index] = newCase;
+    } else {
+      updatedCases.push(newCase);
+    }
+  }
+  
+  const success = saveCases(updatedCases);
+  if (success) {
+    res.json({ message: `${cases.length} cases added or updated`, total: updatedCases.length });
+  } else {
+    res.status(500).json({ error: 'Failed to save cases' });
+  }
+});
+
+// Get all training data
+finetuningRouter.get('/training-data', (req: Request, res: Response) => {
+  res.json(loadCases());
+});
+
+// Enable or disable fine-tuning
+finetuningRouter.post('/toggle', (req: Request, res: Response) => {
+  const { enabled, modelId, fallbackToDefaultModel } = req.body;
+  const config = loadConfig();
+  
+  config.enabled = !!enabled;
+  if (modelId) config.modelId = modelId;
+  if (typeof fallbackToDefaultModel === 'boolean') {
+    config.fallbackToDefaultModel = fallbackToDefaultModel;
+  }
+  
+  const success = saveConfig(config);
+  if (success) {
+    res.json({ message: `Fine-tuning ${config.enabled ? 'enabled' : 'disabled'}`, config });
+  } else {
+    res.status(500).json({ error: 'Failed to update configuration' });
+  }
+});
+
+// Prepare and upload data for fine-tuning (requires API key)
+finetuningRouter.post('/prepare-data', async (req: Request, res: Response) => {
+  try {
+    const openai = getOpenAIClient();
+    const cases = loadCases();
+    
+    if (cases.length === 0) {
+      return res.status(400).json({ error: 'No training data available' });
+    }
+    
+    console.log(`Preparing ${cases.length} cases for fine-tuning`);
+    
+    // Create the directory for prepared data if it doesn't exist
+    const preparedDataDir = path.join(__dirname, 'data', 'prepared');
+    if (!fs.existsSync(preparedDataDir)) {
+      fs.mkdirSync(preparedDataDir, { recursive: true });
+    }
+    
+    // Define case structure for type checking
+    interface Case {
+      imageFileName: string;
+      diagnosis?: string;
+      severity?: string;
+      bodyPart?: string;
+      treatments?: string[] | string;
+      description?: string;
+    }
+    
+    // Define training data format type
+    interface TrainingExample {
+      messages: {
+        role: string;
+        content: string | Array<{
+          type: string;
+          text?: string;
+          image_url?: { url: string };
+        }>;
+      }[];
+    }
+    
+    // Format training data as per OpenAI requirements
+    // Each case should have the specific format needed for GPT training
+    const formattedData: TrainingExample[] = cases.map((caseData: Case) => {
+      // Default prompt format for skin condition analysis
+      const userPrompt = `Analyze this skin condition and provide a detailed diagnosis:\n[IMAGE]`;
+      
+      // Format the response format consistently for all training examples
+      const assistantResponse = `The image shows ${caseData.diagnosis || 'a skin condition'}.
+Diagnosis: ${caseData.diagnosis || 'Unknown'}
+Severity: ${caseData.severity || 'Not specified'}
+Body Part: ${caseData.bodyPart || 'Not specified'}
+Recommended Treatments: ${Array.isArray(caseData.treatments) ? caseData.treatments.join(', ') : caseData.treatments || 'Not specified'}
+Description: ${caseData.description || 'No additional details available'}`;
+
+      return {
+        messages: [
+          { role: "system", content: "You are a dermatology diagnostic assistant. Provide accurate analysis of skin conditions." },
+          { role: "user", content: [
+              { type: "text", text: userPrompt },
+              { type: "image_url", image_url: { url: `file://${path.join(imagesDir, caseData.imageFileName)}` } }
+            ]
+          },
+          { role: "assistant", content: assistantResponse }
+        ]
+      };
+    });
+    
+    // Write the formatted data to JSONL file
+    const outputPath = path.join(preparedDataDir, 'training_data.jsonl');
+    const jsonlContent = formattedData.map((item: TrainingExample) => JSON.stringify(item)).join('\n');
+    fs.writeFileSync(outputPath, jsonlContent);
+    
+    // In a real implementation, you would upload this file to OpenAI
+    res.json({ 
+      message: `Successfully prepared ${cases.length} cases for fine-tuning`, 
+      dataPath: outputPath,
+      cases: cases.length
+    });
+    
+  } catch (error) {
+    console.error('Error preparing data:', error);
+    res.status(500).json({ error: (error as Error).message || 'Failed to prepare data' });
+  }
+});
+
+// Start a fine-tuning job (requires API key)
+finetuningRouter.post('/start-job', async (req: Request, res: Response) => {
+  try {
+    const openai = getOpenAIClient();
+    
+    // Check if prepared data exists
+    const preparedDataPath = path.join(__dirname, 'data', 'prepared', 'training_data.jsonl');
+    if (!fs.existsSync(preparedDataPath)) {
+      return res.status(400).json({ 
+        error: 'No prepared training data found', 
+        message: 'Please run "Prepare Data" first before starting a fine-tuning job'
+      });
+    }
+    
+    console.log('Starting fine-tuning job with data:', preparedDataPath);
+    
+    // In a real implementation, you would:
+    // 1. Upload the training file to OpenAI
+    // 2. Create a fine-tuning job using the file ID
+    // 3. Store and track the job ID
+    
+    // The real OpenAI API implementation would look like this:
+    /*
+    // 1. Upload the file
+    const file = await openai.files.create({
+      file: fs.createReadStream(preparedDataPath),
+      purpose: 'fine-tune',
+    });
+    
+    // 2. Create a fine-tuning job
+    const fineTune = await openai.fineTuning.jobs.create({
+      training_file: file.id,
+      model: 'gpt-4-vision-preview', // Base model to fine-tune
+      suffix: 'dermatology-v1',
+    });
+    
+    // 3. Save the job details
+    const config = loadConfig();
+    config.jobId = fineTune.id;
+    config.jobStatus = fineTune.status;
+    saveConfig(config);
+    */
+    
+    // For now, simulate the job being created
+    const config = loadConfig();
+    config.jobId = 'ftjob-' + Date.now();
+    config.jobStatus = 'created';
+    config.jobStartTime = new Date().toISOString();
+    saveConfig(config);
+    
+    res.json({ 
+      message: 'Fine-tuning job started successfully', 
+      jobId: config.jobId,
+      status: config.jobStatus,
+      note: 'This is a simulated job. In production, this would start a real OpenAI fine-tuning job.'
+    });
+    
+  } catch (error) {
+    console.error('Error starting fine-tuning job:', error);
+    res.status(500).json({ error: (error as Error).message || 'Failed to start fine-tuning job' });
+  }
+});
+
+// Get HTML for the admin interface
+finetuningRouter.get('/admin-page', (req: Request, res: Response) => {
+  const config = loadConfig();
+  const cases = loadCases();
+  
+  // Get list of images
+  let images: string[] = [];
+  if (fs.existsSync(imagesDir)) {
+    images = fs.readdirSync(imagesDir)
+      .filter(file => /\.(jpg|jpeg|png|webp)$/i.test(file));
+  }
+  
+  // Count images
+  let imageCount = images.length;
+  
+  // Generate image options for select dropdown
+  const imageOptions = images.map(img => `<option value="${img}">${img}</option>`).join('');
+  
+  const html = `
+  <!DOCTYPE html>
+  <html lang="en">
+  <head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>LUME Fine-Tuning Admin</title>
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap@5.2.3/dist/css/bootstrap.min.css">
+    <style>
+      body {
+        background-color: #f8f9fa;
+        padding-top: 20px;
+      }
+      .header {
+        background: linear-gradient(to right, #d4af37, #f0db4f);
+        color: #000;
+        padding: 15px;
+        border-radius: 10px;
+        margin-bottom: 20px;
+      }
+      .card {
+        box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+        margin-bottom: 20px;
+      }
+      .btn-gold {
+        background-color: #d4af37;
+        color: white;
+      }
+      .btn-gold:hover {
+        background-color: #c19d2a;
+        color: white;
+      }
+      .dropzone {
+        border: 2px dashed #d4af37;
+        border-radius: 5px;
+        padding: 20px;
+        text-align: center;
+        cursor: pointer;
+      }
+      #preview {
+        display: flex;
+        flex-wrap: wrap;
+        margin-top: 20px;
+      }
+      .thumbnail {
+        width: 100px;
+        height: 100px;
+        object-fit: cover;
+        margin: 5px;
+        border-radius: 5px;
+      }
+      #trainingDataForm.disabled {
+        opacity: 0.6;
+        pointer-events: none;
+      }
+      pre {
+        background-color: #f8f9fa;
+        padding: 15px;
+        border-radius: 5px;
+        overflow-x: auto;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="container">
+      <div class="header text-center">
+        <h1>LUME Fine-Tuning Administration</h1>
+        <p>Manage your dermatology AI fine-tuning operations</p>
+      </div>
+      
+      <div class="row">
+        <div class="col-md-12">
+          <div class="card">
+            <div class="card-header">
+              <h4>Fine-Tuning Status</h4>
+            </div>
+            <div class="card-body">
+              <p><strong>Fine-Tuning Enabled:</strong> <span id="enabledStatus">${config.enabled ? 'Yes' : 'No'}</span></p>
+              <p><strong>Current Model ID:</strong> <span id="modelId">${config.modelId || 'None'}</span></p>
+              <p><strong>Training Cases:</strong> <span id="caseCount">${cases.length}</span></p>
+              <p><strong>Training Images:</strong> <span id="imageCount">${imageCount}</span></p>
+              
+              <div class="form-check form-switch mb-3">
+                <input class="form-check-input" type="checkbox" id="enableFinetuning" ${config.enabled ? 'checked' : ''}>
+                <label class="form-check-label" for="enableFinetuning">Enable Fine-Tuning</label>
+              </div>
+              
+              <div class="mb-3">
+                <label for="modelIdInput" class="form-label">Model ID</label>
+                <input type="text" class="form-control" id="modelIdInput" value="${config.modelId || ''}">
+              </div>
+              
+              <div class="mb-3">
+                <h5>Job Status</h5>
+                <div class="row">
+                  <div class="col-md-6">
+                    <p><strong>Job ID:</strong> <span id="jobId">${config.jobId || 'None'}</span></p>
+                    <p><strong>Status:</strong> <span id="jobStatus">${config.jobStatus || 'None'}</span></p>
+                  </div>
+                  <div class="col-md-6">
+                    <p><strong>Started:</strong> <span id="jobStartTime">${config.jobStartTime || 'N/A'}</span></p>
+                  </div>
+                </div>
+              </div>
+              
+              <button id="saveConfigBtn" class="btn btn-gold">Save Configuration</button>
+            </div>
+          </div>
+        </div>
+        
+        <div class="col-md-12">
+          <div class="card">
+            <div class="card-header">
+              <h4>Image Upload</h4>
+            </div>
+            <div class="card-body">
+              <div id="uploadErrorContainer" class="alert alert-danger" style="display: none;">
+                <h5>Upload Error</h5>
+                <p id="uploadErrorMessage"></p>
+                <div id="uploadErrorDetails" class="mt-2 small"></div>
+              </div>
+
+              <div id="dropzone" class="dropzone">
+                <p>Drag & drop image files here or click to select files</p>
+                <p class="small text-muted">Accepted formats: JPG, PNG, WebP - Max size: 50MB</p>
+                <input type="file" id="fileInput" multiple accept="image/jpeg,image/png,image/webp" style="display: none;">
+              </div>
+              <div id="preview"></div>
+              <div class="mt-3">
+                <button id="uploadBtn" class="btn btn-gold" disabled>Upload Images</button>
+                <span id="uploadStatus"></span>
+              </div>
+            </div>
+          </div>
+        </div>
+        
+        <div class="col-md-12">
+          <div class="card">
+            <div class="card-header">
+              <h4>Training Data Management</h4>
+            </div>
+            <div class="card-body">
+              <p>Add or edit cases for the images you've uploaded. Each case should include diagnosis information.</p>
+              
+              <div id="noImagesMessage" class="alert alert-warning" style="display: none;">
+                <strong>No images available!</strong> Please upload images in the section above before adding training data.
+              </div>
+              
+              <form id="trainingDataForm">
+                <div class="mb-3">
+                  <label for="imageSelect" class="form-label">Select Image</label>
+                  <select class="form-select" id="imageSelect">
+                    <option value="">Select an image...</option>
+                    ${imageOptions}
+                  </select>
+                </div>
+                
+                <div class="mb-3 image-preview-container" style="display: none;" id="imagePreviewContainer">
+                  <label class="form-label">Image Preview</label>
+                  <div class="border p-2 rounded">
+                    <img id="imagePreview" src="" alt="Selected image" class="img-fluid" style="max-height: 200px;">
+                  </div>
+                </div>
+                
+                <div class="mb-3">
+                  <label for="diagnosisInput" class="form-label">Diagnosis</label>
+                  <input type="text" class="form-control" id="diagnosisInput">
+                </div>
+                
+                <div class="mb-3">
+                  <label for="severityInput" class="form-label">Severity</label>
+                  <select class="form-select" id="severityInput">
+                    <option value="Mild">Mild</option>
+                    <option value="Moderate">Moderate</option>
+                    <option value="Severe">Severe</option>
+                  </select>
+                </div>
+                
+                <div class="mb-3">
+                  <label for="bodyPartInput" class="form-label">Body Part</label>
+                  <input type="text" class="form-control" id="bodyPartInput">
+                </div>
+                
+                <div class="mb-3">
+                  <label for="treatmentsInput" class="form-label">Treatments (comma separated)</label>
+                  <input type="text" class="form-control" id="treatmentsInput">
+                </div>
+                
+                <div class="mb-3">
+                  <label for="descriptionInput" class="form-label">Description</label>
+                  <textarea class="form-control" id="descriptionInput" rows="3"></textarea>
+                </div>
+                
+                <button type="button" id="saveDataBtn" class="btn btn-gold">Save Case</button>
+                <button type="button" id="viewAllDataBtn" class="btn btn-outline-dark ms-2">View All Cases</button>
+              </form>
+            </div>
+          </div>
+        </div>
+        
+        <div class="col-md-12 mt-3">
+          <div class="card">
+            <div class="card-header">
+              <h4>Fine-Tuning Operations</h4>
+            </div>
+            <div class="card-body">
+              <div class="alert alert-warning">
+                These operations require an OpenAI API key to be set in your environment.
+              </div>
+              
+              <button id="prepareDataBtn" class="btn btn-gold me-2">Prepare Data</button>
+              <button id="startJobBtn" class="btn btn-gold">Start Fine-Tuning Job</button>
+              
+              <div id="operationResult" class="mt-3"></div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+    
+    <!-- Modal for showing all cases -->
+    <div class="modal fade" id="allCasesModal" tabindex="-1">
+      <div class="modal-dialog modal-xl">
+        <div class="modal-content">
+          <div class="modal-header">
+            <h5 class="modal-title">All Training Cases</h5>
+            <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+          </div>
+          <div class="modal-body">
+            <pre id="allCasesContent"></pre>
+          </div>
+        </div>
+      </div>
+    </div>
+    
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.2.3/dist/js/bootstrap.bundle.min.js"></script>
+    <script>
+      document.addEventListener('DOMContentLoaded', function() {
+        // Elements
+        const dropzone = document.getElementById('dropzone');
+        const fileInput = document.getElementById('fileInput');
+        const preview = document.getElementById('preview');
+        const uploadBtn = document.getElementById('uploadBtn');
+        const uploadStatus = document.getElementById('uploadStatus');
+        const enableFinetuning = document.getElementById('enableFinetuning');
+        const modelIdInput = document.getElementById('modelIdInput');
+        const saveConfigBtn = document.getElementById('saveConfigBtn');
+        const imageSelect = document.getElementById('imageSelect');
+        const diagnosisInput = document.getElementById('diagnosisInput');
+        const severityInput = document.getElementById('severityInput');
+        const bodyPartInput = document.getElementById('bodyPartInput');
+        const treatmentsInput = document.getElementById('treatmentsInput');
+        const descriptionInput = document.getElementById('descriptionInput');
+        const saveDataBtn = document.getElementById('saveDataBtn');
+        const viewAllDataBtn = document.getElementById('viewAllDataBtn');
+        const prepareDataBtn = document.getElementById('prepareDataBtn');
+        const startJobBtn = document.getElementById('startJobBtn');
+        const operationResult = document.getElementById('operationResult');
+        const allCasesModal = new bootstrap.Modal(document.getElementById('allCasesModal'));
+        const allCasesContent = document.getElementById('allCasesContent');
+        
+        // Data storage
+        let selectedFiles = [];
+        let cases = [];
+        
+        // Image selection handler
+        imageSelect.addEventListener('change', function() {
+          const selectedImage = this.value;
+          
+          // Update image preview
+          if (selectedImage) {
+            document.getElementById('imagePreview').src = '/api/fine-tuning/image/' + selectedImage;
+            document.getElementById('imagePreviewContainer').style.display = 'block';
+          } else {
+            document.getElementById('imagePreviewContainer').style.display = 'none';
+          }
+          
+          // Find existing data for this image
+          const existingCase = cases.find(c => c.imageFileName === selectedImage);
+          if (existingCase) {
+            diagnosisInput.value = existingCase.diagnosis || '';
+            severityInput.value = existingCase.severity || '';
+            bodyPartInput.value = existingCase.bodyPart || '';
+            treatmentsInput.value = Array.isArray(existingCase.treatments) 
+              ? existingCase.treatments.join(', ') 
+              : existingCase.treatments || '';
+            descriptionInput.value = existingCase.description || '';
+          } else {
+            // Clear form if no existing data
+            diagnosisInput.value = '';
+            severityInput.value = '';
+            bodyPartInput.value = '';
+            treatmentsInput.value = '';
+            descriptionInput.value = '';
+          }
+        });
+        
+        // Dropzone handling
+        dropzone.addEventListener('click', () => fileInput.click());
+        dropzone.addEventListener('dragover', (e) => {
+          e.preventDefault();
+          dropzone.style.backgroundColor = '#f0f0f0';
+        });
+        dropzone.addEventListener('dragleave', () => {
+          dropzone.style.backgroundColor = '';
+        });
+        dropzone.addEventListener('drop', (e) => {
+          e.preventDefault();
+          dropzone.style.backgroundColor = '';
+          handleFiles(e.dataTransfer.files);
+        });
+        
+        fileInput.addEventListener('change', () => {
+          handleFiles(fileInput.files);
+        });
+        
+        // File input handling with validation
+        function handleFiles(files) {
+          // Hide any previous error messages
+          document.getElementById('uploadErrorContainer').style.display = 'none';
+          
+          selectedFiles = [];
+          preview.innerHTML = '';
+          
+          // Validate each file before adding to selected files
+          Array.from(files).forEach(file => {
+            // Check file type
+            const validTypes = ['image/jpeg', 'image/png', 'image/webp'];
+            if (!validTypes.includes(file.type)) {
+              showFileError('File "' + file.name + '" is not a supported image type. Please use JPG, PNG, or WebP formats.');
+              return;
+            }
+            
+            // Check file size (50MB limit)
+            const maxSize = 50 * 1024 * 1024;
+            if (file.size > maxSize) {
+              showFileError(`File "${file.name}" exceeds the 50MB size limit. Please compress or resize the image.`);
+              return;
+            }
+            
+            // File is valid, add to preview
+            selectedFiles.push(file);
+            const reader = new FileReader();
+            reader.onload = e => {
+              const img = document.createElement('img');
+              img.src = e.target.result;
+              img.classList.add('thumbnail');
+              img.title = file.name;
+              preview.appendChild(img);
+            };
+            reader.onerror = () => {
+              showFileError(`Failed to read file "${file.name}". The file may be corrupted.`);
+            };
+            reader.readAsDataURL(file);
+          });
+          
+          uploadBtn.disabled = selectedFiles.length === 0;
+        }
+        
+        // Display file validation errors
+        function showFileError(message) {
+          const errorContainer = document.getElementById('uploadErrorContainer');
+          const errorMessage = document.getElementById('uploadErrorMessage');
+          
+          errorContainer.style.display = 'block';
+          errorMessage.textContent = message;
+        }
+        
+        // Upload images
+        uploadBtn.addEventListener('click', async () => {
+          if (selectedFiles.length === 0) return;
+          
+          uploadStatus.textContent = 'Uploading...';
+          const formData = new FormData();
+          selectedFiles.forEach(file => {
+            formData.append('images', file);
+          });
+          
+          // Hide any previous error messages
+          document.getElementById('uploadErrorContainer').style.display = 'none';
+          
+          try {
+            const response = await fetch('/api/fine-tuning/upload-image', {
+              method: 'POST',
+              body: formData
+            });
+            
+            const result = await response.json();
+            if (response.ok) {
+              uploadStatus.textContent = result.message;
+              loadImageOptions();
+              updateStats();
+              // Clear preview and selected files after successful upload
+              preview.innerHTML = '';
+              selectedFiles = [];
+              uploadBtn.disabled = true;
+            } else {
+              // Display detailed error information
+              const errorContainer = document.getElementById('uploadErrorContainer');
+              const errorMessage = document.getElementById('uploadErrorMessage');
+              const errorDetails = document.getElementById('uploadErrorDetails');
+              
+              errorContainer.style.display = 'block';
+              errorMessage.textContent = result.message || 'Upload failed';
+              
+              // Add more detailed information if available
+              let detailsText = '';
+              if (result.error) detailsText += `Error: ${result.error}<br>`;
+              if (result.details) detailsText += `Details: ${result.details}<br>`;
+              
+              errorDetails.innerHTML = detailsText;
+              uploadStatus.textContent = 'Error: ' + (result.error || 'Upload failed');
+              
+              console.error('Upload error:', result);
+            }
+          } catch (error) {
+            // Display network or parsing errors
+            const errorContainer = document.getElementById('uploadErrorContainer');
+            const errorMessage = document.getElementById('uploadErrorMessage');
+            
+            errorContainer.style.display = 'block';
+            errorMessage.textContent = 'Network or server error: ' + error.message;
+            uploadStatus.textContent = 'Error: ' + error.message;
+            
+            console.error('Upload exception:', error);
+          }
+        });
+        
+        // Save configuration
+        saveConfigBtn.addEventListener('click', async () => {
+          try {
+            const response = await fetch('/api/fine-tuning/toggle', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                enabled: enableFinetuning.checked,
+                modelId: modelIdInput.value
+              })
+            });
+            
+            const result = await response.json();
+            if (response.ok) {
+              document.getElementById('enabledStatus').textContent = result.config.enabled ? 'Yes' : 'No';
+              document.getElementById('modelId').textContent = result.config.modelId || 'None';
+              alert('Configuration saved successfully');
+            } else {
+              alert('Error: ' + (result.error || 'Failed to save configuration'));
+            }
+          } catch (error) {
+            alert('Error: ' + error.message);
+          }
+        });
+        
+        // Load image options
+        async function loadImageOptions() {
+          try {
+            const response = await fetch('/api/fine-tuning/status');
+            if (!response.ok) {
+              // Handle authentication or other errors
+              if (response.status === 401) {
+                console.warn('Authentication required for full access to fine-tuning management');
+                // Still continue to allow viewing the page in demo mode
+              } else {
+                throw new Error("Server returned " + response.status + ": " + response.statusText);
+              }
+            }
+            
+            // Parse the data if available, or use default empty values
+            let data = { stats: { totalImages: 0, totalCases: 0 } };
+            try {
+              data = await response.json();
+            } catch (e) {
+              console.warn('Failed to parse status response');
+            }
+            
+            // Also fetch cases for existing data
+            let cases = [];
+            try {
+              const casesResponse = await fetch('/api/fine-tuning/training-data');
+              if (casesResponse.ok) {
+                cases = await casesResponse.json();
+              }
+            } catch (e) {
+              console.warn('Failed to load training data');
+            }
+            
+            // Update the stats displays
+            document.getElementById('imageCount').textContent = data.stats.totalImages || 0;
+            document.getElementById('caseCount').textContent = cases.length || 0;
+            
+            // Clear and populate the image select dropdown
+            imageSelect.innerHTML = '<option value="">Select an image...</option>';
+            
+            if (data.stats.totalImages > 0) {
+              try {
+                // Get the list of images for the dropdown
+                const imagesResponse = await fetch('/api/fine-tuning/images');
+                if (imagesResponse.ok) {
+                  const imagesList = await imagesResponse.json();
+                  
+                  // Add each image to the dropdown
+                  imagesList.forEach(image => {
+                    const option = document.createElement('option');
+                    option.value = image;
+                    option.textContent = image;
+                    imageSelect.appendChild(option);
+                  });
+                  
+                  // Enable the form and hide the message
+                  document.getElementById('trainingDataForm').classList.remove('disabled');
+                  document.getElementById('noImagesMessage').style.display = 'none';
+                } else {
+                  throw new Error('Failed to load image list');
+                }
+              } catch (e) {
+                console.error('Error loading images:', e);
+                document.getElementById('trainingDataForm').classList.add('disabled');
+                document.getElementById('noImagesMessage').style.display = 'block';
+                document.getElementById('noImagesMessage').innerHTML = 
+                  '<strong>Error loading images!</strong> ' + (e.message || 'Please try again later.');
+              }
+            } else {
+              // No images available, show message and disable form
+              document.getElementById('trainingDataForm').classList.add('disabled');
+              document.getElementById('noImagesMessage').style.display = 'block';
+            }
+          } catch (error) {
+            console.error('Error loading data:', error);
+            alert('Error: ' + (error.message || 'Failed to load data. Please try again.'));
+          }
+        }
+        
+        // Save case data
+        saveDataBtn.addEventListener('click', async () => {
+          const imageFileName = imageSelect.value;
+          if (!imageFileName) {
+            alert('Please select an image');
+            return;
+          }
+          
+          const newCase = {
+            imageFileName,
+            diagnosis: diagnosisInput.value,
+            severity: severityInput.value,
+            bodyPart: bodyPartInput.value,
+            treatments: treatmentsInput.value.split(',').map(t => t.trim()).filter(t => t),
+            description: descriptionInput.value
+          };
+          
+          try {
+            const response = await fetch('/api/fine-tuning/training-data', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ cases: [newCase] })
+            });
+            
+            const result = await response.json();
+            if (response.ok) {
+              alert('Case saved successfully');
+              document.getElementById('caseCount').textContent = result.total;
+              
+              // Clear form
+              imageSelect.value = '';
+              diagnosisInput.value = '';
+              severityInput.value = '';
+              bodyPartInput.value = '';
+              treatmentsInput.value = '';
+              descriptionInput.value = '';
+              
+              // Hide image preview
+              document.getElementById('imagePreviewContainer').style.display = 'none';
+            } else {
+              alert('Error: ' + (result.error || 'Failed to save case'));
+            }
+          } catch (error) {
+            alert('Error: ' + error.message);
+          }
+        });
+        
+        // View all cases
+        viewAllDataBtn.addEventListener('click', async () => {
+          try {
+            const response = await fetch('/api/fine-tuning/training-data');
+            const data = await response.json();
+            
+            allCasesContent.textContent = JSON.stringify(data, null, 2);
+            allCasesModal.show();
+          } catch (error) {
+            alert('Error: ' + error.message);
+          }
+        });
+        
+        // Prepare data
+        prepareDataBtn.addEventListener('click', async () => {
+          operationResult.innerHTML = '<div class="alert alert-info">Preparing data...</div>';
+          
+          try {
+            const response = await fetch('/api/fine-tuning/prepare-data', {
+              method: 'POST'
+            });
+            
+            const result = await response.json();
+            if (response.ok) {
+              operationResult.innerHTML = \`<div class="alert alert-success">\${result.message}</div>\`;
+            } else {
+              operationResult.innerHTML = \`<div class="alert alert-danger">\${result.error || 'Failed to prepare data'}</div>\`;
+            }
+          } catch (error) {
+            operationResult.innerHTML = \`<div class="alert alert-danger">\${error.message}</div>\`;
+          }
+        });
+        
+        // Start job
+        startJobBtn.addEventListener('click', async () => {
+          operationResult.innerHTML = '<div class="alert alert-info">Starting fine-tuning job...</div>';
+          
+          try {
+            const response = await fetch('/api/fine-tuning/start-job', {
+              method: 'POST'
+            });
+            
+            const result = await response.json();
+            if (response.ok) {
+              operationResult.innerHTML = \`<div class="alert alert-success">\${result.message}</div>\`;
+            } else {
+              operationResult.innerHTML = \`<div class="alert alert-danger">\${result.error || 'Failed to start fine-tuning job'}</div>\`;
+            }
+          } catch (error) {
+            operationResult.innerHTML = \`<div class="alert alert-danger">\${error.message}</div>\`;
+          }
+        });
+        
+        // Update status stats
+        function updateStats() {
+          fetch('/api/fine-tuning/status')
+            .then(res => res.json())
+            .then(data => {
+              document.getElementById('enabledStatus').textContent = data.config.enabled ? 'Yes' : 'No';
+              document.getElementById('modelId').textContent = data.config.modelId || 'None';
+              document.getElementById('caseCount').textContent = data.stats.totalCases;
+              document.getElementById('imageCount').textContent = data.stats.totalImages;
+            })
+            .catch(err => console.error('Error fetching stats:', err));
+        }
+        
+        // Initialize page
+        loadImageOptions();
+        updateStats();
+      });
+    </script>
+  </body>
+  </html>
+  `;
+  
+  res.send(html);
+});
+
+// Export for integration with main server
+export default finetuningRouter;
